@@ -1,0 +1,117 @@
+name: Sync from Monorepo
+
+on:
+    repository_dispatch:
+        types: [portal-frontend-update]
+    workflow_dispatch:
+        inputs:
+            source_sha:
+                description: 'Source commit SHA (optional)'
+                required: false
+            source_ref:
+                description: 'Source ref (optional)'
+                required: false
+
+jobs:
+    sync:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Setup Git
+              run: |
+                  git config --global user.name 'github-actions[bot]'
+                  git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+            # Detect default branch
+            - name: Get default branch
+              id: default-branch
+              run: |
+                  DEFAULT_BRANCH=$(git remote show origin | grep 'HEAD branch' | cut -d' ' -f5)
+                  echo "name=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+
+            # Determine source ref
+            - name: Set source ref
+              id: set-ref
+              run: |
+                  SOURCE_SHA="${{ github.event.client_payload.source_sha || github.event.inputs.source_sha }}"
+                  SOURCE_REF="${{ github.event.client_payload.source_ref || github.event.inputs.source_ref || 'develop' }}"
+
+                  if [ -z "$SOURCE_SHA" ]; then
+                    echo "ref=$SOURCE_REF" >> $GITHUB_OUTPUT
+                    echo "source_desc=$SOURCE_REF branch" >> $GITHUB_OUTPUT
+                  else
+                    echo "ref=$SOURCE_SHA" >> $GITHUB_OUTPUT
+                    echo "source_desc=commit $SOURCE_SHA" >> $GITHUB_OUTPUT
+                  fi
+
+            - name: Clone and prepare monorepo
+              run: |
+                  # Clone into temp directory to avoid git repo warning
+                  mkdir -p temp && cd temp
+                  git clone https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/lumeweb/web source
+                  cd source
+
+                  # Checkout desired ref
+                  git checkout ${{ steps.set-ref.outputs.ref }}
+
+                  # Extract portal-frontend history to a branch
+                  git subtree split -P apps/portal-frontend -b portal-frontend-split
+                  cd ..
+
+                  # Pack the split history for transfer
+                  cd source
+                  git pack-refs
+                  cp -r .git/refs/heads/portal-frontend-split ../portal-frontend-split.ref
+                  cd ..
+
+                  # Move back to main repo directory
+                  cd ..
+
+                  # Import the split history
+                  mkdir -p .git/refs/heads
+                  cp temp/portal-frontend-split.ref .git/refs/heads/portal-frontend-split
+
+                  # Clean up temp directory
+                  rm -rf temp
+
+            - name: Sync changes
+              id: sync
+              run: |
+                  # Recreate sync branch from portal-frontend-split
+                  git branch -D sync/portal-frontend || true
+                  git checkout -b sync/portal-frontend portal-frontend-split
+
+                  # Check if there are actual changes by comparing with existing branch
+                  if git rev-parse --quiet --verify origin/sync/portal-frontend; then
+                    if git diff --quiet HEAD origin/sync/portal-frontend; then
+                      echo "changes_detected=false" >> $GITHUB_OUTPUT
+                      exit 0
+                    fi
+                  fi
+
+                  echo "changes_detected=true" >> $GITHUB_OUTPUT
+
+            - name: Push changes
+              if: steps.sync.outputs.changes_detected == 'true'
+              run: |
+                  git push -f origin sync/portal-frontend
+
+            - name: Create or Update Pull Request
+              if: steps.sync.outputs.changes_detected == 'true'
+              uses: peter-evans/create-pull-request@v5
+              with:
+                  title: "chore: sync portal-frontend from upstream"
+                  body: |
+                      Automated sync from monorepo ${{ steps.set-ref.outputs.source_desc }}
+
+                      This PR includes all related commit history from the portal-frontend directory.
+                      This is an automatically updating PR that keeps the portal-frontend in sync with upstream.
+                  branch: "sync/portal-frontend"
+                  delete-branch: false
+                  base: ${{ steps.default-branch.outputs.name }}
+                  labels: |
+                      sync
+                      automated
