@@ -1,0 +1,121 @@
+name: Sync from Monorepo
+
+on:
+    repository_dispatch:
+        types: [portal-frontend-update]
+    workflow_dispatch:
+        inputs:
+            source_sha:
+                description: 'Source commit SHA (optional)'
+                required: false
+            source_ref:
+                description: 'Source ref (optional)'
+                required: false
+
+jobs:
+    sync:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Setup Git
+              run: |
+                  git config --global user.name 'github-actions[bot]'
+                  git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+            # Detect default branch
+            - name: Get default branch
+              id: default-branch
+              run: |
+                  DEFAULT_BRANCH=$(git remote show origin | grep 'HEAD branch' | cut -d' ' -f5)
+                  echo "name=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+
+            # Determine source ref
+            - name: Set source ref
+              id: set-ref
+              run: |
+                  SOURCE_SHA="${{ github.event.client_payload.source_sha || github.event.inputs.source_sha }}"
+                  SOURCE_REF="${{ github.event.client_payload.source_ref || github.event.inputs.source_ref || 'develop' }}"
+
+                  if [ -z "$SOURCE_SHA" ]; then
+                    echo "ref=$SOURCE_REF" >> $GITHUB_OUTPUT
+                    echo "source_desc=$SOURCE_REF branch" >> $GITHUB_OUTPUT
+                  else
+                    echo "ref=$SOURCE_SHA" >> $GITHUB_OUTPUT
+                    echo "source_desc=commit $SOURCE_SHA" >> $GITHUB_OUTPUT
+                  fi
+
+            - name: Clone and prepare monorepo
+              run: |
+                  # Clone the source repository with PAT
+                  git clone --quiet https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/lumeweb/web source
+                  cd source
+                  git checkout ${{ steps.set-ref.outputs.ref }}
+                  
+                  # Extract frontend directory with history
+                  git subtree split -P apps/portal-frontend -b temp-split
+                  
+                  # Go back and create local branch
+                  cd ..
+                  git fetch source temp-split:portal-frontend-split
+                  
+                  # Cleanup
+                  rm -rf source
+
+            - name: Sync changes
+              id: sync
+              run: |
+                  # Create sync branch
+                  git checkout -b sync/portal-frontend portal-frontend-split
+                  
+                  # Merge with allow-unrelated-histories
+                  git merge --allow-unrelated-histories develop || true
+                  
+                  # Check for actual file differences
+                  if git diff --stat --quiet develop || [ "$(git diff --stat develop | wc -l)" -eq "0" ]; then
+                    echo "changes_detected=false" >> $GITHUB_OUTPUT
+                    exit 0
+                  fi
+                  
+                  echo "changes_detected=true" >> $GITHUB_OUTPUT
+
+            - name: Push changes
+              if: steps.sync.outputs.changes_detected == 'true'
+              run: |
+                  git push -f origin sync/portal-frontend
+
+            - name: Ensure Labels Exist
+              if: steps.sync.outputs.changes_detected == 'true'
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  # Array of labels to ensure exist
+                  labels=("sync" "automated")
+                  
+                  # Check and create labels if they don't exist
+                  for label in "${labels[@]}"; do
+                    if ! gh label list | grep -q "^$label\s"; then
+                      echo "Creating label: $label"
+                      gh label create "$label" --description "Automatically managed label" --color "0075ca"
+                    fi
+                  done
+
+            - name: Create or Update Pull Request
+              if: steps.sync.outputs.changes_detected == 'true'
+              run: |
+                  PR_NUMBER=$(gh pr list --head sync/portal-frontend --json number -q '.[0].number')
+                  if [ -n "$PR_NUMBER" ]; then
+                    echo "Updating existing PR #$PR_NUMBER"
+                  else
+                    gh pr create \
+                      --title "chore: sync portal-frontend from upstream" \
+                      --body "Automated sync from monorepo ${{ steps.set-ref.outputs.source_desc }}" \
+                      --base ${{ steps.default-branch.outputs.name }} \
+                      --head sync/portal-frontend \
+                      --label sync \
+                      --label automated
+                  fi
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

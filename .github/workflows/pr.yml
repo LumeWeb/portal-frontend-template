@@ -1,0 +1,39 @@
+name: Create Tag on Sync Merge
+
+on:
+    pull_request:
+        types: [closed]
+        branches:
+            - main
+
+jobs:
+    tag:
+        # Only run if PR was merged (not just closed) and it was our sync PR
+        if: |
+            github.event.pull_request.merged == true &&
+            github.event.pull_request.head.ref == 'sync/portal-frontend'
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  fetch-depth: 0
+
+            - name: Create and push tag
+              run: |
+                  DATE=$(date +%Y%m%d)
+
+                  # Get latest tag for today
+                  LATEST_TAG=$(git tag -l "${DATE}.*" | sort -V | tail -n 1)
+
+                  if [ -z "$LATEST_TAG" ]; then
+                    NEW_TAG="${DATE}.1"
+                  else
+                    COUNTER=$(echo $LATEST_TAG | cut -d. -f2)
+                    NEW_TAG="${DATE}.$((COUNTER + 1))"
+                  fi
+
+                  # Create and push tag
+                  git tag $NEW_TAG
+                  git push origin $NEW_TAG
