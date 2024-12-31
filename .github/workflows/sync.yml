@@ -49,49 +49,36 @@ jobs:
 
             - name: Clone and prepare monorepo
               run: |
-                  # Clone into temp directory to avoid git repo warning
-                  mkdir -p temp && cd temp
-                  git clone https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/lumeweb/web source
+                  # Clone the source repository with PAT
+                  git clone --quiet https://x-access-token:${{ secrets.PAT_TOKEN }}@github.com/lumeweb/web source
                   cd source
-
-                  # Checkout desired ref
                   git checkout ${{ steps.set-ref.outputs.ref }}
-
-                  # Extract portal-frontend history to a branch
-                  git subtree split -P apps/portal-frontend -b portal-frontend-split
+                  
+                  # Extract frontend directory with history
+                  git subtree split -P apps/portal-frontend -b temp-split
+                  
+                  # Go back and create local branch
                   cd ..
-
-                  # Pack the split history for transfer
-                  cd source
-                  git pack-refs
-                  cp -r .git/refs/heads/portal-frontend-split ../portal-frontend-split.ref
-                  cd ..
-
-                  # Move back to main repo directory
-                  cd ..
-
-                  # Import the split history
-                  mkdir -p .git/refs/heads
-                  cp temp/portal-frontend-split.ref .git/refs/heads/portal-frontend-split
-
-                  # Clean up temp directory
-                  rm -rf temp
+                  git fetch source temp-split:portal-frontend-split
+                  
+                  # Cleanup
+                  rm -rf source
 
             - name: Sync changes
               id: sync
               run: |
-                  # Recreate sync branch from portal-frontend-split
-                  git branch -D sync/portal-frontend || true
+                  # Create sync branch
                   git checkout -b sync/portal-frontend portal-frontend-split
-
-                  # Check if there are actual changes by comparing with existing branch
-                  if git rev-parse --quiet --verify origin/sync/portal-frontend; then
-                    if git diff --quiet HEAD origin/sync/portal-frontend; then
-                      echo "changes_detected=false" >> $GITHUB_OUTPUT
-                      exit 0
-                    fi
+                  
+                  # Merge with allow-unrelated-histories
+                  git merge --allow-unrelated-histories develop || true
+                  
+                  # Check for actual file differences
+                  if git diff --stat --quiet develop || [ "$(git diff --stat develop | wc -l)" -eq "0" ]; then
+                    echo "changes_detected=false" >> $GITHUB_OUTPUT
+                    exit 0
                   fi
-
+                  
                   echo "changes_detected=true" >> $GITHUB_OUTPUT
 
             - name: Push changes
@@ -99,19 +86,36 @@ jobs:
               run: |
                   git push -f origin sync/portal-frontend
 
+            - name: Ensure Labels Exist
+              if: steps.sync.outputs.changes_detected == 'true'
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  # Array of labels to ensure exist
+                  labels=("sync" "automated")
+                  
+                  # Check and create labels if they don't exist
+                  for label in "${labels[@]}"; do
+                    if ! gh label list | grep -q "^$label\s"; then
+                      echo "Creating label: $label"
+                      gh label create "$label" --description "Automatically managed label" --color "0075ca"
+                    fi
+                  done
+
             - name: Create or Update Pull Request
               if: steps.sync.outputs.changes_detected == 'true'
-              uses: peter-evans/create-pull-request@v5
-              with:
-                  title: "chore: sync portal-frontend from upstream"
-                  body: |
-                      Automated sync from monorepo ${{ steps.set-ref.outputs.source_desc }}
-
-                      This PR includes all related commit history from the portal-frontend directory.
-                      This is an automatically updating PR that keeps the portal-frontend in sync with upstream.
-                  branch: "sync/portal-frontend"
-                  delete-branch: false
-                  base: ${{ steps.default-branch.outputs.name }}
-                  labels: |
-                      sync
-                      automated
+              run: |
+                  PR_NUMBER=$(gh pr list --head sync/portal-frontend --json number -q '.[0].number')
+                  if [ -n "$PR_NUMBER" ]; then
+                    echo "Updating existing PR #$PR_NUMBER"
+                  else
+                    gh pr create \
+                      --title "chore: sync portal-frontend from upstream" \
+                      --body "Automated sync from monorepo ${{ steps.set-ref.outputs.source_desc }}" \
+                      --base ${{ steps.default-branch.outputs.name }} \
+                      --head sync/portal-frontend \
+                      --label sync \
+                      --label automated
+                  fi
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
